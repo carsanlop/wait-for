@@ -1,0 +1,291 @@
+#!/bin/sh
+#
+# Checks the availability (or unavailability) of a given host.
+# Intended to use within a docker container to control startup order.
+
+# GLOBAL: If not set, the default timeout is 3600 seconds (one hour).
+__TIMEOUT=3600
+
+# GLOBAL
+# Whether to avoid printing normal information or not.
+# 0 (default)   - Do not print informational messages.
+# 1             - Print informational messages.
+__QUIET=0
+
+# GLOBAL
+# Whether to print verbose information or not.
+# 0 (default)   - Do not print trace messages.
+# 1             - Print trace messages.
+__VERBOSE=0
+
+# GLOBAL
+# The mode for the check.
+# wait-for-up (default)   Waits until the host is up.
+# wait-for-down           Waits until the host is down.
+__MODE="wait-for-up"
+
+#######################################
+# Display an information message with help related to the usage of this script.
+# Globals:
+#   None
+# Arguments:
+#   $1 Exit code to use
+# Returns:
+#   None
+#######################################
+usage() {
+  cat << EOF
+Usage: ${0##*/} [options] [-- command args]
+Waits until a given host is up or down, and then executes a command.
+
+Options:
+  -?, --help                    Display this help and exit.
+  -h, --host HOST               Set the host that will be checked.
+                                In wait-for mode, the target must be a host and port separated by a colon (:).
+                                In wait-for-exit mode, the target can be anything accepted by ping.
+  -t, --timeout TIMEOUT         Set the timeout for the check to fail.
+                                (default: 3600 seconds)
+  -m, --mode MODE             	Specifiy the mode for this script.
+                                "wait-for-up" waits until the given host is up, using netcat.
+                                "wait-for-down" waits until the given host is down, using ping.
+                                (default: wait-for-up)
+  -q, --quiet                   Do not display any output.
+  -v, --verbose                 Display trace information.
+
+  -- command args               Execute command with args after the probe finishes
+EOF
+  exit $1
+}
+
+#######################################
+# Starts the appropiate check process depending on the set mode.
+# Also checks that the host (and, optionally, port) provided are valid.
+# Globals:
+#   __INPUT_HOST
+# Arguments:
+#   $@  The command to execute.
+# Returns:
+#   None
+#######################################
+start() {
+  # In wait-for mode, ensure that the host is valid.
+  # A valid host must be provided in host:port format.
+  if [ "${__MODE}" = "wait-for-up" ]; then
+    # Cut the host and port.
+    local HOST=$(printf "%s\n" "$__INPUT_HOST"| cut -d : -f 1)
+    local PORT=$(printf "%s\n" "$__INPUT_HOST"| cut -d : -f 2)
+
+    wait_for_up "${HOST}" "${PORT}" "${@}"
+
+  # In wait-for-exit mode, ensure that the host is valid.
+  # A valid host must NOT have a port, which is checked through the presence of a colon (:).
+  elif [ "${__MODE}" = "wait-for-down" ]; then
+    local HOST=$__INPUT_HOST
+
+    wait_for_down "${HOST}" "${@}"
+
+  # Any other mode is not allowed.
+  else
+    log_err "An unknown mode has been specified. Valid modes are wait-for and wait-for-exit."
+  fi
+
+}
+
+#######################################
+# Periodically checks availability of the provided host.
+# When the host is up, executes a command and exits.
+# Globals:
+#   __TIMEOUT
+# Arguments:
+#   $1  The host that will be checked.
+#   $2  The port that will be checked.
+#   $@  The command that will be executed.
+# Returns:
+#   None
+#######################################
+wait_for_up() {
+  # Parse the received parameters.
+  local HOST=$1; shift
+  local PORT=$1; shift
+  local COMMAND=$@
+  log_info "Waiting for ${HOST}: to be up before executing ${COMMAND}..."
+  log_trace "Timeout: ${__TIMEOUT}"
+
+  log_info "Waiting for $HOST:$PORT to be up..."
+
+  for i in `seq ${__TIMEOUT}` ; do
+    nc -z "$HOST" "$PORT" > /dev/null 2>&1
+    
+    # Retrieve and log the RESULT.
+    RESULT=$?
+    log_trace "Check #${i}: ${RESULT}"
+
+    # A 127 status code means that the command was not found.
+    if [ "${RESULT}" -eq 127 ]; then
+      log_err "Command nc is not installed!"
+    fi
+
+    if [ $RESULT -eq 0 ] ; then
+      if [ $# -gt 0 ] ; then
+        exec "$@"
+      fi
+      exit 0
+    fi
+    sleep 1
+  done
+  echo "Operation timed out" >&2
+  exit 1
+}
+
+#######################################
+# Periodically checks availability of the provided host.
+# When the host is down, executes a command and exits.
+# Globals:
+#   __TIMEOUT
+# Arguments:
+#   $1  The host that will be checked.
+#   $@  The command that will be executed.
+# Returns:
+#   None
+#######################################
+wait_for_down() {
+  # Parse the received parameters.
+  local HOST=$1; shift
+  local COMMAND=$@
+  log_info "Waiting for ${HOST} to be down before executing ${COMMAND}..."
+  log_trace "Timeout: ${__TIMEOUT}"
+
+  # Start the loop.
+  for i in `seq ${__TIMEOUT}` ; do
+    ping -c1 ${HOST} > /dev/null 2>&1
+    
+    # Retrieve and log the RESULT.
+    RESULT=$?
+    log_trace "Check #${i}: ${RESULT}"
+
+    # A 127 status code means that the command was not found.
+    if [ "${RESULT}" -eq 127 ]; then
+      log_err "Command ping is not installed!"
+    fi
+
+    if [ $RESULT -eq 0 ] ; then
+      if [ $# -gt 0 ] ; then
+        exec "${COMMAND}"
+      fi
+      exit 0
+    fi
+
+    sleep 1
+  done
+
+  log_err "The operation has timed out"
+}
+
+log_err() {
+#   if [ "$__QUIET" -ne 1 ]; then printf "%s\n" "$*" 1>&2; fi
+  if [ "${__QUIET}" -ne 1 ]; then
+    echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')]: ERROR: $@" >&2
+  fi
+
+  exit 1
+}
+
+log_info() {
+    if [ "${__QUIET}" -ne 1 ]; then
+      echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')]: $@" 2>&2
+    fi
+}
+
+log_trace() {
+    if [ "${__VERBOSE}" -ne 0 ]; then
+      echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')]: $@" 2>&2
+    fi
+}
+
+# Read and process the parameters.
+while [ $# -gt 0 ]
+do
+  case "$1" in
+    # Option: --help
+    "-?"|"--help")
+      usage 0
+      ;;
+
+    # Option: --host
+    "-h"|"--host")
+      if [ "$2" ]; then
+        __INPUT_HOST=$2
+        shift
+      else
+        log_err "\"--host\" requires an option argument."
+      fi
+      ;;
+    "--host="?*)
+      __INPUT_HOST=${1#*=} # Delete everything up to "=" and assign the remainder.
+      ;;
+    "--host=")
+      log_err "\"--host\" requires an option argument."
+      ;;
+
+     # Option: --mode
+    "-m"|"--mode")
+      if [ "$2" ]; then
+        __MODE=$2
+        shift
+      else
+        log_err "\"--mode\" requires an option argument."
+      fi
+      ;;
+    "--mode="?*)
+      __MODE=${1#*=} # Delete everything up to "=" and assign the remainder.
+      ;;
+    "--mode=")
+      log_err "\"--mode\" requires an option argument."
+      ;;
+
+     # Option: --timeout
+    "-t"|"--timeout")
+      if [ "$2" ]; then
+        __TIMEOUT=$2
+        shift
+      else
+        log_err "\"--timeout\" requires an option argument."
+      fi
+      ;;
+    "--timeout="?*)
+      __TIMEOUT=${1#*=} # Delete everything up to "=" and assign the remainder.
+      ;;
+    "--timeout=")
+      log_err "\"--timeout\" requires an option argument."
+      ;;
+
+    # Option: --verbose
+    "-v"|"--verbose")
+      __VERBOSE=1
+      readonly __VERBOSE
+      ;;
+
+    # Option: --quiet
+    "-q"|"--quiet")
+      __QUIET=1
+      readonly __QUIET
+      ;;
+
+    # Option: END
+    "--")
+      shift
+      break
+      ;;
+
+    # Option: UNKNOWN
+    -?*)
+      log_trace "An unknown option has been provided: $1"
+      usage 1
+      ;;
+  esac
+
+  shift
+done
+
+# Start the availability check.
+start ${@}
